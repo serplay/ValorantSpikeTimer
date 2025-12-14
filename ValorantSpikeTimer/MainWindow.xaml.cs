@@ -1,8 +1,8 @@
 ﻿using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -18,20 +18,30 @@ namespace ValorantSpikeTimer
         private double _totalMilliseconds = 45000;
         private IntPtr _valorantHandle = IntPtr.Zero;
         private bool _valorantVisible = false;
+        private Config? _config;
+        private bool _cooldownActive = false;
+        private DateTime _cooldownEndTime;
 
-        // ===== Scaling baseline =====
+        private double _scaleFactor;
+
+        // ===== Overlay baseline (for timer positioning) =====
         private const double BASELINE_SCREEN_HEIGHT = 1440;
         private const double BASELINE_OVERLAY_HEIGHT = 80;
         private const double BASELINE_OVERLAY_WIDTH = 300;
         private const double BASELINE_FONT_SIZE = 24;
-        private const double BASELINE_TOP_OFFSET = 92;
+        private const double BASELINE_TOP_OFFSET = 112;  // Increased from 102 to drop timer 20px total lower than original
 
-        private double _scaleFactor;
+        // Color thresholds for spike indicator (red/orange)
+        // Widened thresholds to handle both HDR and SDR modes
+        private const int COLOR_RED_MIN = 120;
+        private const int COLOR_GREEN_MAX = 30;
+        private const int COLOR_BLUE_MAX = 30;
 
         // ===== Win32 constants =====
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_TRANSPARENT = 0x20;
         private const int WS_EX_LAYERED = 0x80000;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
 
         // ===== Win32 imports =====
         [DllImport("user32.dll")]
@@ -41,31 +51,46 @@ namespace ValorantSpikeTimer
         private static extern int SetWindowLong(IntPtr hwnd, int index, int value);
 
         [DllImport("user32.dll")]
-        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         private static extern bool IsIconic(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-        [DllImport("user32.dll")]
-        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
+        [DllImport("gdi32.dll")]
+        private static extern uint GetPixel(IntPtr hdc, int x, int y);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDC(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDesktopWindow();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        private const int HOTKEY_ID = 9000;
+        private const uint MOD_CONTROL = 0x0002;
+        private const uint MOD_SHIFT = 0x0004;
+        private const uint VK_UP = 0x26;
+
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+        
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
         {
@@ -79,37 +104,108 @@ namespace ValorantSpikeTimer
         {
             InitializeComponent();
             Loaded += OnLoaded;
+            KeyDown += OnKeyDown;
+            SourceInitialized += OnSourceInitialized;
         }
 
-        // ===========================
-        // Startup
-        // ===========================
+        private void OnKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            // Ctrl+Shift+Up to recalibrate
+            if (e.Key == System.Windows.Input.Key.Up && 
+                (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control &&
+                (Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift)
+            {
+                ShowCalibration();
+                e.Handled = true;
+            }
+        }
+
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
             try
             {
-                Debug.WriteLine("[VSTimer] Initialization starting...");
+                // Load or create configuration
+                _config = Config.Load();
+                if (_config == null || !_config.IsValid())
+                {
+                    ShowCalibration();
+                    
+                    if (_config == null || !_config.IsValid())
+                    {
+                        Application.Current.Shutdown();
+                        return;
+                    }
+                }
 
                 CalculateScaleFactor();
                 ScaleOverlay();
+                
+#if DEBUG
+                // In debug mode, make window fullscreen to show debug markers anywhere on screen
+                Left = 0;
+                Top = 0;
+                Width = SystemParameters.PrimaryScreenWidth;
+                Height = SystemParameters.PrimaryScreenHeight;
+#else
+                // In release mode, use normal centered positioning
                 PositionOverlayCenter();
+#endif
 
                 // Apply window styles BEFORE showing
                 MakeClickThrough();
                 SetWindowForFullscreen();
 
-                // Set properties
-                Topmost = true;
+                // Start hidden (topmost is set in SetWindowForFullscreen without activation)
                 Visibility = Visibility.Hidden;
 
-                Debug.WriteLine($"[VSTimer] Overlay initialized: Size={Width}x{Height}, Position=({Left},{Top})");
-
                 StartDetectionTimer();
-                StartPolling();
+                InitializePolling();  // Initialize but don't start the timer yet
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[VSTimer] Error during initialization: {ex.Message}");
+                // Log only critical errors
+                System.Diagnostics.Debug.WriteLine($"[VSTimer] Critical error: {ex.Message}");
+            }
+        }
+
+        private void ShowCalibration()
+        {
+            try
+            {
+                var calibrationWindow = new CalibrationWindow();
+                Hide(); // Hide overlay during calibration
+                
+                bool? result = calibrationWindow.ShowDialog();
+                
+                if (result == true && calibrationWindow.Result != null)
+                {
+                    _config = calibrationWindow.Result;
+                    Show(); // Show overlay again
+                    
+                    // Immediately check for spike after calibration to start timer without waiting for next detection cycle
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            if (IsSpikeIndicatorVisible())
+                            {
+                                if (_pollTimer != null && !_pollTimer.IsEnabled)
+                                {
+                                    StartPolling();
+                                }
+                            }
+                        }
+                        catch { }
+                    }), System.Windows.Threading.DispatcherPriority.Background);
+                }
+                else
+                {
+                    Show(); // Show overlay again even if cancelled
+                }
+            }
+            catch
+            {
+                Show(); // Ensure overlay is visible again
             }
         }
 
@@ -123,9 +219,16 @@ namespace ValorantSpikeTimer
 
         private void ScaleOverlay()
         {
+#if DEBUG
+            // In debug mode with fullscreen window, just scale the font
+            TimerText.FontSize = BASELINE_FONT_SIZE * _scaleFactor;
+            TimerText.Margin = new Thickness(0, BASELINE_TOP_OFFSET * _scaleFactor, 0, 0);
+#else
+            // In release mode, scale the window size and font
             Width = BASELINE_OVERLAY_WIDTH * _scaleFactor;
             Height = BASELINE_OVERLAY_HEIGHT * _scaleFactor;
             TimerText.FontSize = BASELINE_FONT_SIZE * _scaleFactor;
+#endif
         }
 
         private void PositionOverlayCenter()
@@ -141,18 +244,11 @@ namespace ValorantSpikeTimer
         {
             var hwnd = new WindowInteropHelper(this).Handle;
             if (hwnd == IntPtr.Zero)
-            {
-                Debug.WriteLine("[VSTimer] Failed to get window handle in MakeClickThrough");
                 return;
-            }
             
             int style = GetWindowLong(hwnd, GWL_EXSTYLE);
-            Debug.WriteLine($"[VSTimer] Current window style: 0x{style:X8}");
-            
             int newStyle = style | WS_EX_LAYERED | WS_EX_TRANSPARENT;
             SetWindowLong(hwnd, GWL_EXSTYLE, newStyle);
-            
-            Debug.WriteLine($"[VSTimer] New window style: 0x{newStyle:X8}");
         }
 
         // ===========================
@@ -162,17 +258,15 @@ namespace ValorantSpikeTimer
         {
             var hwnd = new WindowInteropHelper(this).Handle;
             if (hwnd == IntPtr.Zero)
-            {
-                Debug.WriteLine("[VSTimer] Failed to get window handle in SetWindowForFullscreen");
                 return;
-            }
             
-            // WS_EX_TOOLWINDOW (0x80) + existing styles
+            // WS_EX_NOACTIVATE prevents the window from being activated
             int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-            int newExStyle = exStyle | 0x00000080; // WS_EX_TOOLWINDOW
+            int newExStyle = exStyle | WS_EX_NOACTIVATE;
             SetWindowLong(hwnd, GWL_EXSTYLE, newExStyle);
             
-            Debug.WriteLine($"[VSTimer] Applied toolwindow style for fullscreen support: 0x{newExStyle:X8}");
+            // Use SetWindowPos with HWND_TOPMOST and SWP_NOACTIVATE to stay on top without stealing focus
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
 
         // ===========================
@@ -182,7 +276,7 @@ namespace ValorantSpikeTimer
         {
             _detectionTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(500)
+                Interval = TimeSpan.FromMilliseconds(16)  // 60 FPS for competitive gaming (was 500ms)
             };
 
             _detectionTimer.Tick += (_, _) => CheckValorantState();
@@ -200,19 +294,7 @@ namespace ValorantSpikeTimer
                 if (!_valorantVisible)
                 {
                     _valorantVisible = true;
-                    Debug.WriteLine("[VSTimer] Valorant detected - showing overlay");
-                    
-                    // Ensure overlay is positioned and visible
                     Visibility = Visibility.Visible;
-                    Topmost = true;
-                    
-                    // Bring window to front
-                    try
-                    {
-                        var hwnd = new WindowInteropHelper(this).Handle;
-                        SetForegroundWindow(hwnd);
-                    }
-                    catch { }
                 }
             }
             else
@@ -222,8 +304,13 @@ namespace ValorantSpikeTimer
                 if (_valorantVisible)
                 {
                     _valorantVisible = false;
-                    Debug.WriteLine("[VSTimer] Valorant not found - hiding overlay");
                     Visibility = Visibility.Hidden;
+                    
+                    // Stop the timer when Valorant is not in focus
+                    if (_pollTimer != null && _pollTimer.IsEnabled)
+                    {
+                        _pollTimer.Stop();
+                    }
                 }
             }
         }
@@ -234,22 +321,13 @@ namespace ValorantSpikeTimer
 
             try
             {
-                // First, try to find the Valorant process
                 var valorantProcesses = Process.GetProcessesByName("VALORANT-Win64-Shipping");
                 
                 if (valorantProcesses.Length == 0)
-                {
-                    Debug.WriteLine("[VSTimer] No Valorant process found");
                     return IntPtr.Zero;
-                }
 
-                Debug.WriteLine($"[VSTimer] Found {valorantProcesses.Length} Valorant process(es)");
-
-                // Get the currently focused window
                 IntPtr foregroundWindow = GetForegroundWindow();
-                Debug.WriteLine($"[VSTimer] Foreground window: {foregroundWindow.ToString()}");
 
-                // For each Valorant process, find its main window
                 foreach (var proc in valorantProcesses)
                 {
                     if (proc.MainWindowHandle != IntPtr.Zero)
@@ -258,60 +336,131 @@ namespace ValorantSpikeTimer
                         bool isMinimized = IsIconic(proc.MainWindowHandle);
                         bool isFocused = proc.MainWindowHandle == foregroundWindow;
                         
-                        Debug.WriteLine($"[VSTimer] Valorant window: Visible={isVisible}, Minimized={isMinimized}, Focused={isFocused}");
-                        
-                        // Check if window is visible, not minimized, AND in focus
                         if (isVisible && !isMinimized && isFocused)
                         {
-                            found = proc.MainWindowHandle;
-                            string mode = DetectWindowMode(proc.MainWindowHandle);
-                            Debug.WriteLine($"[VSTimer] Found Valorant window in focus in {mode} mode");
-                            break;
+                            // Check if we're in cooldown period
+                            if (_cooldownActive)
+                            {
+                                if (DateTime.Now < _cooldownEndTime)
+                                {
+                                    // Still in cooldown - return the window handle but don't detect spike
+                                    found = proc.MainWindowHandle;
+                                    break;
+                                }
+                                else
+                                {
+                                    // Cooldown ended
+                                    _cooldownActive = false;
+                                }
+                            }
+
+                            // Check for spike indicator
+                            bool spikeVisible = IsSpikeIndicatorVisible();
+                            
+                            if (spikeVisible)
+                            {
+                                found = proc.MainWindowHandle;
+                                
+                                // Start/restart the timer when spike is detected
+                                if (_pollTimer != null && !_pollTimer.IsEnabled)
+                                {
+                                    StartPolling();
+                                }
+                                
+                                break;
+                            }
                         }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[VSTimer] Exception in FindValorantWindow: {ex.Message}");
-            }
-
-            return found;
-        }
-
-        private string DetectWindowMode(IntPtr hWnd)
-        {
-            try
-            {
-                // Get window rect
-                if (GetWindowRect(hWnd, out RECT rect))
-                {
-                    int windowWidth = rect.Right - rect.Left;
-                    int windowHeight = rect.Bottom - rect.Top;
-
-                    int screenWidth = (int)SystemParameters.PrimaryScreenWidth;
-                    int screenHeight = (int)SystemParameters.PrimaryScreenHeight;
-
-                    // Check if window covers entire screen
-                    if (windowWidth >= screenWidth && windowHeight >= screenHeight)
-                    {
-                        return "Fullscreen";
-                    }
-                    else
-                    {
-                        return "Windowed/Borderless";
                     }
                 }
             }
             catch { }
 
-            return "Unknown";
+            return found;
+        }
+
+        private bool IsSpikeIndicatorVisible()
+        {
+            try
+            {
+                if (_config == null || !_config.IsValid())
+                    return false;
+
+                // Use exact coordinates from config - 3 points
+                int leftX = _config.LeftPixelX;
+                int leftY = _config.LeftPixelY;
+                int centerX = _config.CenterPixelX;
+                int centerY = _config.CenterPixelY;
+                int rightX = _config.RightPixelX;
+                int rightY = _config.RightPixelY;
+
+                // OPTIMIZED: Batch pixel reads - get DC once, read all pixels, release once
+                IntPtr desktopHwnd = GetDesktopWindow();
+                IntPtr hdc = GetDC(desktopHwnd);
+                if (hdc == IntPtr.Zero)
+                    return false;
+
+                try
+                {
+                    // Read all 3 pixels with single DC
+                    uint pixel1 = GetPixel(hdc, leftX, leftY);
+                    uint pixel2 = GetPixel(hdc, centerX, centerY);
+                    uint pixel3 = GetPixel(hdc, rightX, rightY);
+
+                    // Extract RGB for all pixels (BGR format in Windows)
+                    int r1 = (int)pixel1 & 0xFF;
+                    int g1 = (int)(pixel1 >> 8) & 0xFF;
+                    int b1 = (int)(pixel1 >> 16) & 0xFF;
+
+                    int r2 = (int)pixel2 & 0xFF;
+                    int g2 = (int)(pixel2 >> 8) & 0xFF;
+                    int b2 = (int)(pixel2 >> 16) & 0xFF;
+
+                    int r3 = (int)pixel3 & 0xFF;
+                    int g3 = (int)(pixel3 >> 8) & 0xFF;
+                    int b3 = (int)(pixel3 >> 16) & 0xFF;
+
+                    // OPTIMIZED: Early exit - check each point and stop as soon as we have 2 matches
+                    int matchCount = 0;
+
+                    // Check left pixel
+                    if ((r1 > _config.RedMin && g1 < _config.GreenMax && b1 < _config.BlueMax) ||
+                        (r1 > 100 && r1 > 2 * (g1 + b1)))
+                    {
+                        matchCount++;
+                    }
+
+                    // Check center pixel
+                    if ((r2 > _config.RedMin && g2 < _config.GreenMax && b2 < _config.BlueMax) ||
+                        (r2 > 100 && r2 > 2 * (g2 + b2)))
+                    {
+                        matchCount++;
+                        if (matchCount >= 2) return true; // Early exit!
+                    }
+
+                    // Check right pixel only if needed
+                    if ((r3 > _config.RedMin && g3 < _config.GreenMax && b3 < _config.BlueMax) ||
+                        (r3 > 100 && r3 > 2 * (g3 + b3)))
+                    {
+                        matchCount++;
+                    }
+
+                    return matchCount >= 2;
+                }
+                finally
+                {
+                    ReleaseDC(desktopHwnd, hdc);
+                }
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         // ===========================
         // Timer logic
         // ===========================
-        private void StartPolling()
+        private void InitializePolling()
         {
             _stopwatch = Stopwatch.StartNew();
 
@@ -321,6 +470,25 @@ namespace ValorantSpikeTimer
             };
 
             _pollTimer.Tick += (_, _) => Poll();
+            // Don't start here - it will start when spike is detected
+        }
+
+        private void StartPolling()
+        {
+            if (_pollTimer == null)
+            {
+                InitializePolling();
+            }
+            
+            _stopwatch.Restart();
+            _totalMilliseconds = 45000;
+            
+            // Make timer visible when starting
+            TimerText.Visibility = Visibility.Visible;
+            
+            // Clear cooldown state when new spike is detected
+            _cooldownActive = false;
+            
             _pollTimer.Start();
         }
 
@@ -330,28 +498,82 @@ namespace ValorantSpikeTimer
 
             if (_totalMilliseconds <= 0)
             {
+                // Timer reached 0 - hide, reset, and start cooldown
+                _pollTimer?.Stop();
                 _stopwatch.Restart();
                 _totalMilliseconds = 45000;
+                TimerText.Visibility = Visibility.Hidden;
+                
+                // Activate 10-second cooldown
+                _cooldownActive = true;
+                _cooldownEndTime = DateTime.Now.AddSeconds(10);
+                return;
             }
 
             int seconds = (int)(_totalMilliseconds / 1000);
-            int milliseconds = (int)(_totalMilliseconds % 1000) / 10;
+            int centiseconds = (int)((_totalMilliseconds % 1000) / 10);
 
             if (_totalMilliseconds <= 10000)
             {
+                // Under 10 seconds: show seconds:centiseconds format (e.g., "9:45")
                 TimerText.Foreground = Brushes.Red;
-                TimerText.Text = $"{seconds:D2}:{milliseconds:D2}";
+                TimerText.Text = $"{seconds}:{centiseconds:D2}";
             }
             else if (_totalMilliseconds <= 25000)
             {
+                // 10-25 seconds: show 0:seconds format (e.g., "0:15")
                 TimerText.Foreground = Brushes.Yellow;
                 TimerText.Text = $"0:{seconds}";
             }
             else
             {
+                // Over 25 seconds: show 0:seconds format (e.g., "0:45")
                 TimerText.Foreground = Brushes.LimeGreen;
                 TimerText.Text = $"0:{seconds}";
             }
+        }
+
+        private void OnSourceInitialized(object? sender, EventArgs e)
+        {
+            try
+            {
+                var helper = new WindowInteropHelper(this);
+                if (helper.Handle != IntPtr.Zero)
+                {
+                    HwndSource source = HwndSource.FromHwnd(helper.Handle);
+                    source.AddHook(WndProc);
+                    RegisterHotKey(helper.Handle, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_UP);
+                }
+            }
+            catch { }
+        }
+
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            const int WM_HOTKEY = 0x0312;
+
+            if (msg == WM_HOTKEY && wParam.ToInt32() == HOTKEY_ID)
+            {
+                Dispatcher.BeginInvoke(new Action(() => ShowCalibration()));
+                handled = true;
+            }
+
+            return IntPtr.Zero;
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            try
+            {
+                var helper = new WindowInteropHelper(this);
+                if (helper.Handle != IntPtr.Zero)
+                {
+                    UnregisterHotKey(helper.Handle, HOTKEY_ID);
+                }
+            }
+            catch { }
+
+            base.OnClosed(e);
         }
     }
 }

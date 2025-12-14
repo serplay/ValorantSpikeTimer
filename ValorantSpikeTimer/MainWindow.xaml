@@ -10,14 +10,14 @@ Background="Transparent"
 Topmost="True"
 ShowInTaskbar="False">
 
-
     <Grid>
+        <!-- Timer text overlay (centered horizontally, positioned at top) -->
         <TextBlock x:Name="TimerText"
-Text="45"
-FontSize="24"
-FontWeight="Bold"
-Foreground="LimeGreen"
-HorizontalAlignment="Center"
-VerticalAlignment="Center" />
+                   Text="0:45"
+                   FontSize="24"
+                   FontWeight="Bold"
+                   Foreground="LimeGreen"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Top" />
     </Grid>
 </Window>
