@@ -29,13 +29,7 @@ namespace ValorantSpikeTimer
         private const double BASELINE_OVERLAY_HEIGHT = 80;
         private const double BASELINE_OVERLAY_WIDTH = 300;
         private const double BASELINE_FONT_SIZE = 24;
-        private const double BASELINE_TOP_OFFSET = 112;  // Increased from 102 to drop timer 20px total lower than original
-
-        // Color thresholds for spike indicator (red/orange)
-        // Widened thresholds to handle both HDR and SDR modes
-        private const int COLOR_RED_MIN = 120;
-        private const int COLOR_GREEN_MAX = 30;
-        private const int COLOR_BLUE_MAX = 30;
+        private const double BASELINE_TOP_OFFSET = 112;
 
         // ===== Win32 constants =====
         private const int GWL_EXSTYLE = -20;
@@ -90,15 +84,6 @@ namespace ValorantSpikeTimer
         private const uint SWP_NOMOVE = 0x0002;
         private const uint SWP_NOACTIVATE = 0x0010;
         private const uint SWP_SHOWWINDOW = 0x0040;
-        
-        [StructLayout(LayoutKind.Sequential)]
-        public struct RECT
-        {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
-        }
 
         public MainWindow()
         {
@@ -110,7 +95,6 @@ namespace ValorantSpikeTimer
 
         private void OnKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
-            // Ctrl+Shift+Up to recalibrate
             if (e.Key == System.Windows.Input.Key.Up && 
                 (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control &&
                 (Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift)
@@ -124,7 +108,6 @@ namespace ValorantSpikeTimer
         {
             try
             {
-                // Load or create configuration
                 _config = Config.Load();
                 if (_config == null || !_config.IsValid())
                 {
@@ -139,33 +122,17 @@ namespace ValorantSpikeTimer
 
                 CalculateScaleFactor();
                 ScaleOverlay();
-                
-#if DEBUG
-                // In debug mode, make window fullscreen to show debug markers anywhere on screen
-                Left = 0;
-                Top = 0;
-                Width = SystemParameters.PrimaryScreenWidth;
-                Height = SystemParameters.PrimaryScreenHeight;
-#else
-                // In release mode, use normal centered positioning
                 PositionOverlayCenter();
-#endif
 
-                // Apply window styles BEFORE showing
                 MakeClickThrough();
                 SetWindowForFullscreen();
 
-                // Start hidden (topmost is set in SetWindowForFullscreen without activation)
                 Visibility = Visibility.Hidden;
 
                 StartDetectionTimer();
-                InitializePolling();  // Initialize but don't start the timer yet
+                InitializePolling();
             }
-            catch (Exception ex)
-            {
-                // Log only critical errors
-                System.Diagnostics.Debug.WriteLine($"[VSTimer] Critical error: {ex.Message}");
-            }
+            catch { }
         }
 
         private void ShowCalibration()
@@ -173,16 +140,15 @@ namespace ValorantSpikeTimer
             try
             {
                 var calibrationWindow = new CalibrationWindow();
-                Hide(); // Hide overlay during calibration
+                Hide();
                 
                 bool? result = calibrationWindow.ShowDialog();
                 
                 if (result == true && calibrationWindow.Result != null)
                 {
                     _config = calibrationWindow.Result;
-                    Show(); // Show overlay again
+                    Show();
                     
-                    // Immediately check for spike after calibration to start timer without waiting for next detection cycle
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
                         try
@@ -200,12 +166,12 @@ namespace ValorantSpikeTimer
                 }
                 else
                 {
-                    Show(); // Show overlay again even if cancelled
+                    Show();
                 }
             }
             catch
             {
-                Show(); // Ensure overlay is visible again
+                Show();
             }
         }
 
@@ -219,16 +185,9 @@ namespace ValorantSpikeTimer
 
         private void ScaleOverlay()
         {
-#if DEBUG
-            // In debug mode with fullscreen window, just scale the font
-            TimerText.FontSize = BASELINE_FONT_SIZE * _scaleFactor;
-            TimerText.Margin = new Thickness(0, BASELINE_TOP_OFFSET * _scaleFactor, 0, 0);
-#else
-            // In release mode, scale the window size and font
             Width = BASELINE_OVERLAY_WIDTH * _scaleFactor;
             Height = BASELINE_OVERLAY_HEIGHT * _scaleFactor;
             TimerText.FontSize = BASELINE_FONT_SIZE * _scaleFactor;
-#endif
         }
 
         private void PositionOverlayCenter()
@@ -260,12 +219,10 @@ namespace ValorantSpikeTimer
             if (hwnd == IntPtr.Zero)
                 return;
             
-            // WS_EX_NOACTIVATE prevents the window from being activated
             int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
             int newExStyle = exStyle | WS_EX_NOACTIVATE;
             SetWindowLong(hwnd, GWL_EXSTYLE, newExStyle);
             
-            // Use SetWindowPos with HWND_TOPMOST and SWP_NOACTIVATE to stay on top without stealing focus
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
 
@@ -276,7 +233,7 @@ namespace ValorantSpikeTimer
         {
             _detectionTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(16)  // 60 FPS for competitive gaming (was 500ms)
+                Interval = TimeSpan.FromMilliseconds(16)
             };
 
             _detectionTimer.Tick += (_, _) => CheckValorantState();
@@ -306,7 +263,6 @@ namespace ValorantSpikeTimer
                     _valorantVisible = false;
                     Visibility = Visibility.Hidden;
                     
-                    // Stop the timer when Valorant is not in focus
                     if (_pollTimer != null && _pollTimer.IsEnabled)
                     {
                         _pollTimer.Stop();
@@ -338,30 +294,25 @@ namespace ValorantSpikeTimer
                         
                         if (isVisible && !isMinimized && isFocused)
                         {
-                            // Check if we're in cooldown period
                             if (_cooldownActive)
                             {
                                 if (DateTime.Now < _cooldownEndTime)
                                 {
-                                    // Still in cooldown - return the window handle but don't detect spike
                                     found = proc.MainWindowHandle;
                                     break;
                                 }
                                 else
                                 {
-                                    // Cooldown ended
                                     _cooldownActive = false;
                                 }
                             }
 
-                            // Check for spike indicator
                             bool spikeVisible = IsSpikeIndicatorVisible();
                             
                             if (spikeVisible)
                             {
                                 found = proc.MainWindowHandle;
                                 
-                                // Start/restart the timer when spike is detected
                                 if (_pollTimer != null && !_pollTimer.IsEnabled)
                                 {
                                     StartPolling();
@@ -385,7 +336,6 @@ namespace ValorantSpikeTimer
                 if (_config == null || !_config.IsValid())
                     return false;
 
-                // Use exact coordinates from config - 3 points
                 int leftX = _config.LeftPixelX;
                 int leftY = _config.LeftPixelY;
                 int centerX = _config.CenterPixelX;
@@ -393,7 +343,6 @@ namespace ValorantSpikeTimer
                 int rightX = _config.RightPixelX;
                 int rightY = _config.RightPixelY;
 
-                // OPTIMIZED: Batch pixel reads - get DC once, read all pixels, release once
                 IntPtr desktopHwnd = GetDesktopWindow();
                 IntPtr hdc = GetDC(desktopHwnd);
                 if (hdc == IntPtr.Zero)
@@ -401,12 +350,10 @@ namespace ValorantSpikeTimer
 
                 try
                 {
-                    // Read all 3 pixels with single DC
                     uint pixel1 = GetPixel(hdc, leftX, leftY);
                     uint pixel2 = GetPixel(hdc, centerX, centerY);
                     uint pixel3 = GetPixel(hdc, rightX, rightY);
 
-                    // Extract RGB for all pixels (BGR format in Windows)
                     int r1 = (int)pixel1 & 0xFF;
                     int g1 = (int)(pixel1 >> 8) & 0xFF;
                     int b1 = (int)(pixel1 >> 16) & 0xFF;
@@ -419,25 +366,21 @@ namespace ValorantSpikeTimer
                     int g3 = (int)(pixel3 >> 8) & 0xFF;
                     int b3 = (int)(pixel3 >> 16) & 0xFF;
 
-                    // OPTIMIZED: Early exit - check each point and stop as soon as we have 2 matches
                     int matchCount = 0;
 
-                    // Check left pixel
                     if ((r1 > _config.RedMin && g1 < _config.GreenMax && b1 < _config.BlueMax) ||
                         (r1 > 100 && r1 > 2 * (g1 + b1)))
                     {
                         matchCount++;
                     }
 
-                    // Check center pixel
                     if ((r2 > _config.RedMin && g2 < _config.GreenMax && b2 < _config.BlueMax) ||
                         (r2 > 100 && r2 > 2 * (g2 + b2)))
                     {
                         matchCount++;
-                        if (matchCount >= 2) return true; // Early exit!
+                        if (matchCount >= 2) return true;
                     }
 
-                    // Check right pixel only if needed
                     if ((r3 > _config.RedMin && g3 < _config.GreenMax && b3 < _config.BlueMax) ||
                         (r3 > 100 && r3 > 2 * (g3 + b3)))
                     {
@@ -470,7 +413,6 @@ namespace ValorantSpikeTimer
             };
 
             _pollTimer.Tick += (_, _) => Poll();
-            // Don't start here - it will start when spike is detected
         }
 
         private void StartPolling()
@@ -483,10 +425,8 @@ namespace ValorantSpikeTimer
             _stopwatch.Restart();
             _totalMilliseconds = 45000;
             
-            // Make timer visible when starting
             TimerText.Visibility = Visibility.Visible;
             
-            // Clear cooldown state when new spike is detected
             _cooldownActive = false;
             
             _pollTimer.Start();
@@ -498,13 +438,11 @@ namespace ValorantSpikeTimer
 
             if (_totalMilliseconds <= 0)
             {
-                // Timer reached 0 - hide, reset, and start cooldown
                 _pollTimer?.Stop();
                 _stopwatch.Restart();
                 _totalMilliseconds = 45000;
                 TimerText.Visibility = Visibility.Hidden;
                 
-                // Activate 10-second cooldown
                 _cooldownActive = true;
                 _cooldownEndTime = DateTime.Now.AddSeconds(10);
                 return;
@@ -515,19 +453,16 @@ namespace ValorantSpikeTimer
 
             if (_totalMilliseconds <= 10000)
             {
-                // Under 10 seconds: show seconds:centiseconds format (e.g., "9:45")
                 TimerText.Foreground = Brushes.Red;
                 TimerText.Text = $"{seconds}:{centiseconds:D2}";
             }
             else if (_totalMilliseconds <= 25000)
             {
-                // 10-25 seconds: show 0:seconds format (e.g., "0:15")
                 TimerText.Foreground = Brushes.Yellow;
                 TimerText.Text = $"0:{seconds}";
             }
             else
             {
-                // Over 25 seconds: show 0:seconds format (e.g., "0:45")
                 TimerText.Foreground = Brushes.LimeGreen;
                 TimerText.Text = $"0:{seconds}";
             }
