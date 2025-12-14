@@ -13,6 +13,7 @@ namespace ValorantSpikeTimer
     {
         private DispatcherTimer _pollTimer;
         private DispatcherTimer _detectionTimer;
+        private DispatcherTimer _verificationTimer;
         private Stopwatch _stopwatch;
 
         private double _totalMilliseconds = 45000;
@@ -21,6 +22,7 @@ namespace ValorantSpikeTimer
         private Config? _config;
         private bool _cooldownActive = false;
         private DateTime _cooldownEndTime;
+        private bool _timerRunning = false;
 
         private double _scaleFactor;
 
@@ -29,7 +31,7 @@ namespace ValorantSpikeTimer
         private const double BASELINE_OVERLAY_HEIGHT = 80;
         private const double BASELINE_OVERLAY_WIDTH = 300;
         private const double BASELINE_FONT_SIZE = 24;
-        private const double BASELINE_TOP_OFFSET = 112;
+        private const double BASELINE_TOP_OFFSET = 115;
 
         // ===== Win32 constants =====
         private const int GWL_EXSTYLE = -20;
@@ -131,6 +133,7 @@ namespace ValorantSpikeTimer
 
                 StartDetectionTimer();
                 InitializePolling();
+                InitializeVerificationTimer();
             }
             catch { }
         }
@@ -153,7 +156,7 @@ namespace ValorantSpikeTimer
                     {
                         try
                         {
-                            if (IsSpikeIndicatorVisible())
+                            if (!_timerRunning && IsSpikeIndicatorVisible())
                             {
                                 if (_pollTimer != null && !_pollTimer.IsEnabled)
                                 {
@@ -267,6 +270,11 @@ namespace ValorantSpikeTimer
                     {
                         _pollTimer.Stop();
                     }
+                    
+                    if (_verificationTimer != null && _verificationTimer.IsEnabled)
+                    {
+                        _verificationTimer.Stop();
+                    }
                 }
             }
         }
@@ -294,6 +302,11 @@ namespace ValorantSpikeTimer
                         
                         if (isVisible && !isMinimized && isFocused)
                         {
+                            if (_timerRunning)
+                            {
+                                return proc.MainWindowHandle;
+                            }
+
                             if (_cooldownActive)
                             {
                                 if (DateTime.Now < _cooldownEndTime)
@@ -415,11 +428,50 @@ namespace ValorantSpikeTimer
             _pollTimer.Tick += (_, _) => Poll();
         }
 
+        private void InitializeVerificationTimer()
+        {
+            _verificationTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(5)
+            };
+
+            _verificationTimer.Tick += (_, _) => VerifySpikeStillPlanted();
+        }
+
+        private void VerifySpikeStillPlanted()
+        {
+            if (!_timerRunning)
+                return;
+
+            if (!IsSpikeIndicatorVisible())
+            {
+                StopTimerDefused();
+            }
+        }
+
+        private void StopTimerDefused()
+        {
+            _pollTimer?.Stop();
+            _verificationTimer?.Stop();
+            _stopwatch.Stop();
+            _totalMilliseconds = 45000;
+            TimerText.Visibility = Visibility.Hidden;
+            
+            _timerRunning = false;
+            _cooldownActive = true;
+            _cooldownEndTime = DateTime.Now.AddSeconds(10);
+        }
+
         private void StartPolling()
         {
             if (_pollTimer == null)
             {
                 InitializePolling();
+            }
+            
+            if (_verificationTimer == null)
+            {
+                InitializeVerificationTimer();
             }
             
             _stopwatch.Restart();
@@ -428,8 +480,10 @@ namespace ValorantSpikeTimer
             TimerText.Visibility = Visibility.Visible;
             
             _cooldownActive = false;
+            _timerRunning = true;
             
             _pollTimer.Start();
+            _verificationTimer.Start();
         }
 
         private void Poll()
@@ -439,10 +493,12 @@ namespace ValorantSpikeTimer
             if (_totalMilliseconds <= 0)
             {
                 _pollTimer?.Stop();
+                _verificationTimer?.Stop();
                 _stopwatch.Restart();
                 _totalMilliseconds = 45000;
                 TimerText.Visibility = Visibility.Hidden;
                 
+                _timerRunning = false;
                 _cooldownActive = true;
                 _cooldownEndTime = DateTime.Now.AddSeconds(10);
                 return;
@@ -456,7 +512,7 @@ namespace ValorantSpikeTimer
                 TimerText.Foreground = Brushes.Red;
                 TimerText.Text = $"{seconds}:{centiseconds:D2}";
             }
-            else if (_totalMilliseconds <= 25000)
+            else if (_totalMilliseconds <= 20000)
             {
                 TimerText.Foreground = Brushes.Yellow;
                 TimerText.Text = $"0:{seconds}";
